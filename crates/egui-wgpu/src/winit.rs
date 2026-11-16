@@ -71,10 +71,13 @@ struct RepaintStats {
     /// The whole repaints by [`FullRepaint`], in its order.
     reasons: [u32; 4],
     /// Seconds spent tessellating and painting the partial and the whole repaints, summed, and
-    /// the longest of either.
+    /// the longest of either. Without the wait for the surface and its presentation, which
+    /// with vsync is mostly a wait for the display.
     partial_seconds: f64,
     full_seconds: f64,
     longest_seconds: f64,
+    /// That wait, summed over the painted frames. A software rasterizer may do its work in it.
+    waiting_seconds: f64,
 }
 
 impl RepaintStats {
@@ -98,7 +101,7 @@ impl RepaintStats {
             let [nothing, surface, options, unbounded] = self.reasons;
             log::debug!(
                 target: "egui_wgpu::partial_repaint",
-                "last {:.1} s at {}x{} px: {} frames skipped, {} partial (on average {:.0}% of the window, {:.1} ms), {} full ({:.1} ms; {nothing} with nothing to compare to, {surface} for the surface, {options} for options, {unbounded} for callbacks); longest {:.1} ms",
+                "last {:.1} s at {}x{} px: {} frames skipped, {} partial (on average {:.0}% of the window, {:.1} ms), {} full ({:.1} ms; {nothing} with nothing to compare to, {surface} for the surface, {options} for options, {unbounded} for callbacks); longest {:.1} ms; waiting for the surface {:.1} ms a painted frame",
                 now.duration_since(since).as_secs_f32(),
                 pixels[0],
                 pixels[1],
@@ -109,6 +112,7 @@ impl RepaintStats {
                 self.full,
                 1000.0 * per(self.full_seconds, self.full),
                 1000.0 * self.longest_seconds,
+                1000.0 * per(self.waiting_seconds, self.partial + self.full),
             );
             *self = Self {
                 since: Some(now),
@@ -136,8 +140,10 @@ impl RepaintStats {
         }
     }
 
-    /// The frame last recorded took `seconds` to tessellate and paint.
-    fn painted(&mut self, whole: bool, seconds: f64) {
+    /// The frame last recorded took `seconds` to tessellate and paint, and `waiting` more
+    /// for the surface.
+    fn painted(&mut self, whole: bool, seconds: f64, waiting: f64) {
+        self.waiting_seconds += waiting;
         if whole {
             self.full_seconds += seconds;
         } else {
@@ -1029,9 +1035,11 @@ impl Painter {
         if let Some(surface_state) = self.surfaces.get_mut(&viewport_id)
             && let Some(retained) = &mut surface_state.retained
         {
+            let waiting = f64::from(vsync_sec.max(0.0));
             retained.stats.painted(
                 damage == epaint::Damage::Full,
-                started.elapsed().as_secs_f64(),
+                (started.elapsed().as_secs_f64() - waiting).max(0.0),
+                waiting,
             );
             if callback {
                 // What it painted outside its rectangle stays when the callback goes: the
