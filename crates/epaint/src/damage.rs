@@ -346,12 +346,13 @@ fn shape_bounds(shape: &Shape, feathering: f32) -> Rect {
                 Rect::EVERYTHING
             }
         }
-        // Turned into paths only when tessellated (a band into one outline for each run), so where their mitered
-        // corners are is not known here.
-        Shape::QuadraticBezier(_) | Shape::CubicBezier(_) | Shape::Band(_) => Rect::EVERYTHING,
+        // Turned into paths only when tessellated (a band into one outline for each run, an ellipse into a polygon
+        // whose corners are sharp where it is narrow), so where their mitered corners are is not known here.
+        Shape::QuadraticBezier(_) | Shape::CubicBezier(_) | Shape::Band(_) | Shape::Ellipse(_) => {
+            Rect::EVERYTHING
+        }
         // Stroked outside the outline, where the visual bounds count half the stroke.
         Shape::Circle(circle) => visual.expand(circle.stroke.width.max(0.0) * 0.5),
-        Shape::Ellipse(ellipse) => visual.expand(ellipse.stroke.width.max(0.0) * 0.5),
         _ => visual,
     }
 }
@@ -790,6 +791,23 @@ mod tests {
         let mut tracker = tracker_after(&[]);
         let damage = tracker.update(
             &[ClippedShape::new(SCREEN, band)],
+            1.0,
+            &TexturesDelta::default(),
+        );
+        assert_covers_only(&damage, &[SCREEN], &[]);
+    }
+
+    #[test]
+    fn an_ellipse_damages_what_it_is_clipped_to() {
+        // Narrow: the polygon it is painted as has sharp ends, mitered beyond the stroke's width.
+        let ellipse = Shape::ellipse_stroke(
+            pos2(100.0, 150.0),
+            vec2(1.0, 100.0),
+            Stroke::new(10.0, Color32::BLACK),
+        );
+        let mut tracker = tracker_after(&[]);
+        let damage = tracker.update(
+            &[ClippedShape::new(SCREEN, ellipse)],
             1.0,
             &TexturesDelta::default(),
         );
