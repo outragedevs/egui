@@ -39,6 +39,8 @@ struct RetainedFrame {
     tracker: epaint::DamageTracker,
     texture: wgpu::Texture,
     stats: RepaintStats,
+    /// How the frame was tessellated: other options paint the same shapes differently.
+    tessellation: Option<epaint::TessellationOptions>,
 }
 
 /// How partial repaint fares, logged at debug level (target `egui_wgpu::partial_repaint`)
@@ -112,6 +114,7 @@ impl RetainedFrame {
             tracker: epaint::DamageTracker::default(),
             texture,
             stats: RepaintStats::default(),
+            tessellation: None,
         }
     }
 
@@ -749,6 +752,7 @@ impl Painter {
         if let Some(surface_state) = self.surfaces.get_mut(&viewport_id) {
             surface_state.retained = None;
         }
+        self.invalidate_textures_elsewhere(viewport_id, textures_delta);
         self.paint(
             viewport_id,
             pixels_per_point,
@@ -759,6 +763,29 @@ impl Painter {
             window,
             None,
         )
+    }
+
+    /// The texture changes of `textures_delta` are applied while `viewport_id` is painted, and
+    /// then gone: tell the retained frames of the other windows, which sample the same textures.
+    fn invalidate_textures_elsewhere(
+        &mut self,
+        viewport_id: ViewportId,
+        textures_delta: &epaint::textures::TexturesDelta,
+    ) {
+        if textures_delta.set.is_empty() {
+            return;
+        }
+        let changed = epaint::DamageTracker::changed_textures(textures_delta);
+        #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
+        for (id, surface_state) in &mut self.surfaces {
+            if *id != viewport_id
+                && let Some(retained) = &mut surface_state.retained
+            {
+                retained
+                    .tracker
+                    .invalidate_textures(changed.iter().copied());
+            }
+        }
     }
 
     /// Like [`Self::paint_and_update_textures`], but from the frame's shapes, which it
@@ -778,6 +805,7 @@ impl Painter {
         window: &Arc<winit::window::Window>,
     ) -> f32 {
         profiling::function_scope!();
+        self.invalidate_textures_elsewhere(viewport_id, textures_delta);
         let Some(surface_state) = self.surfaces.get(&viewport_id) else {
             return 0.0;
         };
@@ -829,9 +857,15 @@ impl Painter {
         )
         .expand(1.0);
         let [r, g, b, a] = clear_color;
-        // Gamma values, like the clear they stand in for (`App::clear_color`): not linear ones.
-        let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let background = egui::Color32::from_rgba_premultiplied(byte(r), byte(g), byte(b), byte(a));
+        // The colour the clear it stands in for leaves in the target. A clear writes its values
+        // as they are; a shape's colour is a gamma one, which the shader of an sRGB target
+        // makes linear first, so there the values go in as linear ones.
+        let background = if render_state.target_format.is_srgb() {
+            egui::Color32::from(egui::Rgba::from_rgba_premultiplied(r, g, b, a))
+        } else {
+            let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+            egui::Color32::from_rgba_premultiplied(byte(r), byte(g), byte(b), byte(a))
+        };
         shapes.insert(
             0,
             epaint::ClippedShape {
@@ -855,11 +889,14 @@ impl Painter {
         let tracked = retained
             .tracker
             .update(&shapes, screen_pixels_per_point, textures_delta);
-        let mut damage = if surface_state.needs_reconfigure {
-            epaint::Damage::Full
-        } else {
-            tracked
-        };
+        let tessellation = self.context.tessellation_options(|options| *options);
+        let mut damage =
+            if surface_state.needs_reconfigure || retained.tessellation != Some(tessellation) {
+                epaint::Damage::Full
+            } else {
+                tracked
+            };
+        retained.tessellation = Some(tessellation);
         retained.stats.record(&damage, screen);
 
         if damage == epaint::Damage::None {
@@ -887,14 +924,14 @@ impl Painter {
         }
 
         let clipped_primitives = self.context.tessellate(shapes, pixels_per_point);
-        if clipped_primitives
+        let callback = clipped_primitives
             .iter()
-            .any(|p| matches!(p.primitive, epaint::Primitive::Callback(_)))
-        {
+            .any(|p| matches!(p.primitive, epaint::Primitive::Callback(_)));
+        if callback {
             // A callback can paint anywhere, scissor or not.
             damage = epaint::Damage::Full;
         }
-        self.paint(
+        let vsync_sec = self.paint(
             viewport_id,
             pixels_per_point,
             clear_color,
@@ -903,7 +940,16 @@ impl Painter {
             capture_data,
             window,
             Some(&damage),
-        )
+        );
+        if callback
+            && let Some(surface_state) = self.surfaces.get_mut(&viewport_id)
+            && let Some(retained) = &mut surface_state.retained
+        {
+            // What it painted outside its rectangle stays when the callback goes: the frame
+            // after one is repainted whole too.
+            retained.tracker.reset();
+        }
+        vsync_sec
     }
 
     /// Paint `clipped_primitives`: the whole window, or, with `damage`, into the surface's

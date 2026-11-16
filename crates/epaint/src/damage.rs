@@ -125,6 +125,9 @@ fn growth(a: Rect, b: Rect) -> f32 {
 #[derive(Default)]
 pub struct DamageTracker {
     previous: Option<Frame>,
+
+    /// Textures that changed outside the [`TexturesDelta`] of the next [`Self::update`].
+    invalidated: HashSet<TextureId>,
 }
 
 struct Frame {
@@ -146,7 +149,8 @@ impl DamageTracker {
         profiling::function_scope!();
         let damage = match &self.previous {
             Some(previous) if previous.pixels_per_point == pixels_per_point => {
-                let changed_textures = changed_textures(textures_delta);
+                let mut changed_textures = Self::changed_textures(textures_delta);
+                changed_textures.extend(self.invalidated.drain());
                 let areas = changed_shapes(&previous.shapes, shapes, &changed_textures)
                     .into_iter()
                     .map(|clipped| painted_area(clipped, pixels_per_point));
@@ -154,6 +158,7 @@ impl DamageTracker {
             }
             _ => Damage::Full,
         };
+        self.invalidated.clear();
         self.previous = Some(Frame {
             shapes: shapes.to_vec(),
             pixels_per_point,
@@ -164,19 +169,29 @@ impl DamageTracker {
     /// Forget the previous frame, e.g. when its pixels were lost. The next [`Self::update`] returns [`Damage::Full`].
     pub fn reset(&mut self) {
         self.previous = None;
+        self.invalidated.clear();
     }
-}
 
-/// Textures whose pixels change, ignoring glyphs added to the font atlas: they land in unused space.
-fn changed_textures(textures_delta: &TexturesDelta) -> HashSet<TextureId> {
-    textures_delta
-        .set
-        .iter()
-        .filter(|(id, deltas)| {
-            **id != TextureId::default() || deltas.iter().any(|delta| delta.pos.is_none())
-        })
-        .map(|(id, _)| *id)
-        .collect()
+    /// Textures whose pixels change with `textures_delta`, ignoring glyphs added to the font atlas: they land in
+    /// unused space.
+    pub fn changed_textures(textures_delta: &TexturesDelta) -> HashSet<TextureId> {
+        textures_delta
+            .set
+            .iter()
+            .filter(|(id, deltas)| {
+                **id != TextureId::default() || deltas.iter().any(|delta| delta.pos.is_none())
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// These textures changed in a [`TexturesDelta`] this tracker is not given, e.g. one applied while another
+    /// window was painted: the shapes sampling them count as changed in the next [`Self::update`].
+    pub fn invalidate_textures(&mut self, textures: impl IntoIterator<Item = TextureId>) {
+        if self.previous.is_some() {
+            self.invalidated.extend(textures);
+        }
+    }
 }
 
 /// The shapes of both frames that are not matched to an identical one in the other, or sample a changed texture.
@@ -300,8 +315,49 @@ fn shape_bounds(shape: &Shape) -> Rect {
             .expand(text.underline.width.max(0.0))
             .rotate_bb(emath::Rot2::from_angle(text.angle))
             .translate(text.pos.to_vec2()),
+        // A stroke's joins are mitered: a sharp corner reaches beyond the stroke's own width.
+        Shape::Path(path) if !path.stroke.is_empty() => {
+            let reach = miter_reach(&path.points, path.closed) * path.stroke.width;
+            if reach.is_finite() {
+                Rect::from_points(&path.points).expand(reach)
+            } else {
+                Rect::EVERYTHING
+            }
+        }
+        // Flattened to a path only when tessellated, so where its corners are is not known here.
+        Shape::QuadraticBezier(bezier) if !bezier.stroke.is_empty() => Rect::EVERYTHING,
+        Shape::CubicBezier(bezier) if !bezier.stroke.is_empty() => Rect::EVERYTHING,
         _ => shape.visual_bounding_rect(),
     }
+}
+
+/// How far the stroke of a path may reach from its points, in stroke widths: at least one (the stroke may lie
+/// wholly on one side), more at a corner sharper than a right angle, where the tessellator's miter join extends
+/// by the stroke's half width over the sine of half the corner's angle. Infinite where the path turns back on
+/// itself.
+fn miter_reach(points: &[emath::Pos2], closed: bool) -> f32 {
+    let n = points.len();
+    let mut reach: f32 = 1.0;
+    if n < 3 {
+        return reach;
+    }
+    let direction = |from: usize, to: usize| (points[to] - points[from]).normalized();
+    let corners = if closed { 0..n } else { 1..n - 1 };
+    for i in corners {
+        let before = direction((i + n - 1) % n, i);
+        let after = direction(i, (i + 1) % n);
+        if before == emath::Vec2::ZERO || after == emath::Vec2::ZERO {
+            // a repeated point: the tessellator joins it squarely
+            continue;
+        }
+        let half = ((before + after) * 0.5).length();
+        reach = reach.max(if half > 0.0 {
+            1.0 / half
+        } else {
+            f32::INFINITY
+        });
+    }
+    reach
 }
 
 #[cfg(test)]
@@ -678,6 +734,49 @@ mod tests {
             tracker.update(&[text("1234567")], 1.0, &TexturesDelta::default()),
             Damage::None,
             "an equal galley laid out again is not a change"
+        );
+    }
+
+    #[test]
+    fn a_sharp_corner_of_a_stroke_is_inside_the_damage() {
+        // A 20 point stroke around a thin triangle: the tips reach far beyond the points.
+        let points = vec![pos2(200.0, 500.0), pos2(300.0, 500.0), pos2(250.0, 100.0)];
+        let triangle = ClippedShape::new(
+            SCREEN,
+            Shape::closed_line(points, Stroke::new(20.0, Color32::BLACK)),
+        );
+        let mut tracker = tracker_after(&[]);
+        let damage = tracker.update(&[triangle], 1.0, &TexturesDelta::default());
+        let tip = Rect::from_min_max(pos2(240.0, 30.0), pos2(260.0, 100.0));
+        assert_covers_only(&damage, &[tip], &[]);
+    }
+
+    #[test]
+    fn a_texture_changed_for_another_window_damages_its_shapes() {
+        let id = TextureId::Managed(7);
+        let mut mesh = crate::Mesh::with_texture(id);
+        let at = Rect::from_min_size(pos2(40.0, 40.0), vec2(20.0, 20.0));
+        mesh.add_rect_with_uv(
+            at,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        let shapes = [
+            rect_at(0.0, 0.0),
+            ClippedShape::new(SCREEN, Shape::mesh(mesh)),
+        ];
+        let mut tracker = tracker_after(&shapes);
+        tracker.invalidate_textures([id]);
+        let damage = tracker.update(&shapes, 1.0, &TexturesDelta::default());
+        assert_covers_only(
+            &damage,
+            &[at],
+            &[Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0))],
+        );
+        assert_eq!(
+            tracker.update(&shapes, 1.0, &TexturesDelta::default()),
+            Damage::None,
+            "an invalidation counts once"
         );
     }
 
