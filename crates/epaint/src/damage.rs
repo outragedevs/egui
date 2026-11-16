@@ -11,6 +11,9 @@ use crate::{ClippedShape, Shape, TextureId, textures::TexturesDelta};
 /// How many shapes ahead [`DamageTracker`] looks to re-align two frames after shapes were inserted or removed.
 const LOOKAHEAD: usize = 16;
 
+/// Coordinates (in points) beyond this are limited to it: no screen is this large.
+const FAR: f32 = 1.0e6;
+
 /// Damaged rectangles closer than this (in points) are merged, painting the gap costs less than another pass.
 const MERGE_GAP: f32 = 16.0;
 
@@ -186,7 +189,9 @@ fn changed_shapes<'a>(
     let (mut i, mut j) = (0, 0);
     while i < previous.len() && j < current.len() {
         if same(&previous[i], &current[j]) {
-            if samples_any(&current[j].shape, changed_textures) {
+            if samples_any(&current[j].shape, changed_textures)
+                || samples_user_texture(&current[j].shape)
+            {
                 changed.push(&current[j]);
             }
             i += 1;
@@ -223,6 +228,15 @@ fn samples_any(shape: &Shape, textures: &HashSet<TextureId>) -> bool {
     }
 }
 
+/// Whether `shape` samples a texture the backend owns ([`TextureId::User`]): its pixels can change without a
+/// [`TexturesDelta`], so the shape always counts as changed.
+fn samples_user_texture(shape: &Shape) -> bool {
+    match shape {
+        Shape::Vec(shapes) => shapes.iter().any(samples_user_texture),
+        _ => matches!(shape.texture_id(), TextureId::User(_)),
+    }
+}
+
 fn same(before: &ClippedShape, now: &ClippedShape) -> bool {
     before.clip_rect == now.clip_rect
         && before.transform_after_tessellation == now.transform_after_tessellation
@@ -255,11 +269,16 @@ fn painted_area(clipped: &ClippedShape, pixels_per_point: f32) -> Rect {
     // feathering spreads a pixel beyond the shape, pixel snapping and the rounded scissor rect up to half a pixel more
     let margin = 2.0 / pixels_per_point;
     let bounds = shape_bounds(&clipped.shape);
-    if !bounds.is_finite() || bounds.is_negative() {
+    if bounds.is_negative() {
         return Rect::NOTHING;
     }
+    // The tessellator paints a shape with infinite bounds (`Rect::EVERYTHING`) over all it is clipped to, so such
+    // a shape damages that, not nothing. Limited here, so the rectangles below stay finite.
+    let far = Rect::from_min_max(emath::pos2(-FAR, -FAR), emath::pos2(FAR, FAR));
+    let bounds = bounds.intersect(far);
     let area = (clipped.transform_after_tessellation * bounds.expand(margin))
-        .intersect(clipped.clip_rect.expand(margin));
+        .intersect(clipped.clip_rect.expand(margin))
+        .intersect(far);
     if area.is_negative() {
         Rect::NOTHING
     } else {
@@ -277,6 +296,8 @@ fn shape_bounds(shape: &Shape) -> Rect {
             .galley
             .mesh_bounds
             .union(text.galley.rect)
+            // the underline is stroked along the bottom of each row, half its width to either side
+            .expand(text.underline.width.max(0.0))
             .rotate_bb(emath::Rot2::from_angle(text.angle))
             .translate(text.pos.to_vec2()),
         _ => shape.visual_bounding_rect(),
@@ -658,6 +679,60 @@ mod tests {
             Damage::None,
             "an equal galley laid out again is not a change"
         );
+    }
+
+    #[test]
+    fn a_shape_with_infinite_bounds_damages_what_it_is_clipped_to() {
+        let everything =
+            |color| ClippedShape::new(SCREEN, RectShape::filled(Rect::EVERYTHING, 0.0, color));
+        let mut tracker = tracker_after(&[everything(Color32::RED)]);
+        let damage = tracker.update(&[everything(Color32::BLUE)], 1.0, &TexturesDelta::default());
+        assert_covers_only(&damage, &[SCREEN], &[]);
+        assert!(region(&damage).bounding_rect().is_finite());
+    }
+
+    #[test]
+    fn a_shape_with_a_backend_texture_is_always_damaged() {
+        let mut mesh = crate::Mesh::with_texture(TextureId::User(7));
+        let at = Rect::from_min_size(pos2(40.0, 40.0), vec2(20.0, 20.0));
+        mesh.add_rect_with_uv(
+            at,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        let shapes = [
+            rect_at(0.0, 0.0),
+            ClippedShape::new(SCREEN, Shape::mesh(mesh)),
+        ];
+        let mut tracker = tracker_after(&shapes);
+        let damage = tracker.update(&shapes, 1.0, &TexturesDelta::default());
+        assert_covers_only(
+            &damage,
+            &[at],
+            &[Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0))],
+        );
+    }
+
+    #[test]
+    fn a_thick_underline_is_inside_the_damage() {
+        let mut fonts = Fonts::new(TextOptions::default(), FontDefinitions::default());
+        let galley = fonts.with_pixels_per_point(1.0).layout_no_wrap(
+            "...".to_owned(),
+            FontId::proportional(14.0),
+            Color32::BLACK,
+        );
+        let underlined = ClippedShape::new(
+            SCREEN,
+            crate::TextShape::new(pos2(100.0, 100.0), Arc::clone(&galley), Color32::BLACK)
+                .with_underline(Stroke::new(12.0, Color32::BLACK)),
+        );
+        let mut tracker = tracker_after(&[]);
+        let damage = tracker.update(&[underlined], 1.0, &TexturesDelta::default());
+        let underline = Rect::from_min_size(
+            pos2(100.0, 100.0) + vec2(0.0, galley.rect.bottom() - 6.0),
+            vec2(galley.rect.width(), 12.0),
+        );
+        assert_covers_only(&damage, &[underline], &[]);
     }
 
     #[test]

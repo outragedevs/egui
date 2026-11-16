@@ -829,7 +829,9 @@ impl Painter {
         )
         .expand(1.0);
         let [r, g, b, a] = clear_color;
-        let background = egui::Color32::from(egui::Rgba::from_rgba_premultiplied(r, g, b, a));
+        // Gamma values, like the clear they stand in for (`App::clear_color`): not linear ones.
+        let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let background = egui::Color32::from_rgba_premultiplied(byte(r), byte(g), byte(b), byte(a));
         shapes.insert(
             0,
             epaint::ClippedShape {
