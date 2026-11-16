@@ -43,8 +43,23 @@ struct RetainedFrame {
     tessellation: Option<epaint::TessellationOptions>,
 }
 
+/// Why a frame was repainted whole.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FullRepaint {
+    /// Nothing to compare to: the first frame, a new size or scale, or after a frame that
+    /// could not be shown (a hidden window).
+    NothingToCompare,
+    /// The surface was configured anew.
+    Surface,
+    /// The tessellation options changed.
+    Options,
+    /// A paint callback or a clip debug option, which paint beyond what is tracked.
+    Unbounded,
+}
+
 /// How partial repaint fares, logged at debug level (target `egui_wgpu::partial_repaint`)
-/// every few seconds, so a report can show whether frames are skipped or repainted whole.
+/// every few seconds, so a report can show whether frames are skipped or repainted whole,
+/// why, and how long painting them took.
 #[derive(Default)]
 struct RepaintStats {
     since: Option<web_time::Instant>,
@@ -53,10 +68,53 @@ struct RepaintStats {
     full: u32,
     /// The share of the window the partial repaints covered, summed.
     partial_share: f64,
+    /// The whole repaints by [`FullRepaint`], in its order.
+    reasons: [u32; 4],
+    /// Seconds spent tessellating and painting the partial and the whole repaints, summed, and
+    /// the longest of either.
+    partial_seconds: f64,
+    full_seconds: f64,
+    longest_seconds: f64,
 }
 
 impl RepaintStats {
-    fn record(&mut self, damage: &epaint::Damage, screen: egui::Rect) {
+    fn record(
+        &mut self,
+        damage: &epaint::Damage,
+        reason: Option<FullRepaint>,
+        screen: egui::Rect,
+        pixels: [u32; 2],
+    ) {
+        let now = web_time::Instant::now();
+        let since = *self.since.get_or_insert(now);
+        if now.duration_since(since).as_secs_f32() >= 5.0 {
+            let per = |sum: f64, count: u32| {
+                if count > 0 {
+                    sum / f64::from(count)
+                } else {
+                    0.0
+                }
+            };
+            let [nothing, surface, options, unbounded] = self.reasons;
+            log::debug!(
+                target: "egui_wgpu::partial_repaint",
+                "last {:.1} s at {}x{} px: {} frames skipped, {} partial (on average {:.0}% of the window, {:.1} ms), {} full ({:.1} ms; {nothing} with nothing to compare to, {surface} for the surface, {options} for options, {unbounded} for callbacks); longest {:.1} ms",
+                now.duration_since(since).as_secs_f32(),
+                pixels[0],
+                pixels[1],
+                self.skipped,
+                self.partial,
+                100.0 * per(self.partial_share, self.partial),
+                1000.0 * per(self.partial_seconds, self.partial),
+                self.full,
+                1000.0 * per(self.full_seconds, self.full),
+                1000.0 * self.longest_seconds,
+            );
+            *self = Self {
+                since: Some(now),
+                ..Self::default()
+            };
+        }
         match damage {
             epaint::Damage::None => self.skipped += 1,
             epaint::Damage::Partial(region) => {
@@ -68,29 +126,24 @@ impl RepaintStats {
                     .sum();
                 self.partial_share += f64::from(area / screen.area().max(1.0));
             }
-            epaint::Damage::Full => self.full += 1,
+            epaint::Damage::Full => {
+                self.full += 1;
+                if let Some(count) = reason.and_then(|reason| self.reasons.get_mut(reason as usize))
+                {
+                    *count += 1;
+                }
+            }
         }
-        let now = web_time::Instant::now();
-        let since = *self.since.get_or_insert(now);
-        if now.duration_since(since).as_secs_f32() >= 5.0 {
-            let average = if self.partial > 0 {
-                100.0 * self.partial_share / f64::from(self.partial)
-            } else {
-                0.0
-            };
-            log::debug!(
-                target: "egui_wgpu::partial_repaint",
-                "last {:.1} s: {} frames skipped, {} partial (on average {average:.0}% of the window), {} full",
-                now.duration_since(since).as_secs_f32(),
-                self.skipped,
-                self.partial,
-                self.full,
-            );
-            *self = Self {
-                since: Some(now),
-                ..Self::default()
-            };
+    }
+
+    /// The frame last recorded took `seconds` to tessellate and paint.
+    fn painted(&mut self, whole: bool, seconds: f64) {
+        if whole {
+            self.full_seconds += seconds;
+        } else {
+            self.partial_seconds += seconds;
         }
+        self.longest_seconds = self.longest_seconds.max(seconds);
     }
 }
 
@@ -909,16 +962,27 @@ impl Painter {
         let unbounded = tessellation.debug_ignore_clip_rects
             || tessellation.debug_paint_clip_rects
             || shapes.iter().any(|clipped| has_callback(&clipped.shape));
-        let mut damage = if surface_state.needs_reconfigure
-            || retained.tessellation != Some(tessellation)
-            || unbounded
-        {
+        let reason = if surface_state.needs_reconfigure {
+            Some(FullRepaint::Surface)
+        } else if retained.tessellation != Some(tessellation) && retained.tessellation.is_some() {
+            Some(FullRepaint::Options)
+        } else if unbounded {
+            Some(FullRepaint::Unbounded)
+        } else if tracked == epaint::Damage::Full || retained.tessellation.is_none() {
+            Some(FullRepaint::NothingToCompare)
+        } else {
+            None
+        };
+        let mut damage = if reason.is_some() {
             epaint::Damage::Full
         } else {
             tracked
         };
         retained.tessellation = Some(tessellation);
-        retained.stats.record(&damage, screen);
+        retained
+            .stats
+            .record(&damage, reason, screen, [width, height]);
+        let started = web_time::Instant::now();
 
         if damage == epaint::Damage::None {
             // Nothing visible changed: no render and no present. New textures are still
@@ -962,13 +1026,18 @@ impl Painter {
             window,
             Some(&damage),
         );
-        if callback
-            && let Some(surface_state) = self.surfaces.get_mut(&viewport_id)
+        if let Some(surface_state) = self.surfaces.get_mut(&viewport_id)
             && let Some(retained) = &mut surface_state.retained
         {
-            // What it painted outside its rectangle stays when the callback goes: the frame
-            // after one is repainted whole too.
-            retained.tracker.reset();
+            retained.stats.painted(
+                damage == epaint::Damage::Full,
+                started.elapsed().as_secs_f64(),
+            );
+            if callback {
+                // What it painted outside its rectangle stays when the callback goes: the
+                // frame after one is repainted whole too.
+                retained.tracker.reset();
+            }
         }
         vsync_sec
     }
