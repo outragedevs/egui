@@ -1236,7 +1236,7 @@ impl Painter {
                             epaint::Damage::Partial(region) => Some(region.rects()),
                             _ => None,
                         };
-                        FrameFill::of(&clipped_primitives, rects, screen, pixels_per_point)
+                        FrameFill::of(&clipped_primitives, rects, screen, screen_pixels_per_point)
                     },
                 );
             }
