@@ -346,8 +346,9 @@ fn shape_bounds(shape: &Shape, feathering: f32) -> Rect {
                 Rect::EVERYTHING
             }
         }
-        // Flattened to a path only when tessellated, so where its corners are is not known here.
-        Shape::QuadraticBezier(_) | Shape::CubicBezier(_) => Rect::EVERYTHING,
+        // Turned into paths only when tessellated (a band into one outline for each run), so where their mitered
+        // corners are is not known here.
+        Shape::QuadraticBezier(_) | Shape::CubicBezier(_) | Shape::Band(_) => Rect::EVERYTHING,
         // Stroked outside the outline, where the visual bounds count half the stroke.
         Shape::Circle(circle) => visual.expand(circle.stroke.width.max(0.0) * 0.5),
         Shape::Ellipse(ellipse) => visual.expand(ellipse.stroke.width.max(0.0) * 0.5),
@@ -773,6 +774,26 @@ mod tests {
         let damage = tracker.update(&[triangle], 1.0, &TexturesDelta::default());
         let tip = Rect::from_min_max(pos2(240.0, 30.0), pos2(260.0, 100.0));
         assert_covers_only(&damage, &[tip], &[]);
+    }
+
+    #[test]
+    fn a_band_damages_what_it_is_clipped_to() {
+        // A band narrowing to a point: its stroke's miter reaches far beyond the samples.
+        let band = crate::BandShape::new(
+            vec![
+                crate::BandPoint::new(100.0, 90.0..=110.0),
+                crate::BandPoint::new(150.0, 99.0..=101.0),
+            ],
+            Color32::RED,
+            Stroke::new(20.0, Color32::BLACK),
+        );
+        let mut tracker = tracker_after(&[]);
+        let damage = tracker.update(
+            &[ClippedShape::new(SCREEN, band)],
+            1.0,
+            &TexturesDelta::default(),
+        );
+        assert_covers_only(&damage, &[SCREEN], &[]);
     }
 
     #[test]
