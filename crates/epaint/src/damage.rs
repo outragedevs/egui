@@ -305,10 +305,16 @@ fn painted_area(clipped: &ClippedShape, pixels_per_point: f32, feathering: f32) 
         return Rect::NOTHING;
     }
     // The tessellator paints a shape with infinite bounds (`Rect::EVERYTHING`) over all it is clipped to, so such
-    // a shape damages that, not nothing. Limited here, so the rectangles below stay finite.
+    // a shape damages that, not nothing. Limited on the screen, after the transform (which may bring far away
+    // geometry into view), so the rectangles below stay finite.
     let far = Rect::from_min_max(emath::pos2(-FAR, -FAR), emath::pos2(FAR, FAR));
-    let bounds = bounds.intersect(far);
-    let area = (clipped.transform_after_tessellation * bounds.expand(margin))
+    let on_screen = clipped.transform_after_tessellation * bounds.expand(margin);
+    let on_screen = if on_screen.is_finite() {
+        on_screen
+    } else {
+        far
+    };
+    let area = on_screen
         .intersect(clipped.clip_rect.expand(margin))
         .intersect(far);
     if area.is_negative() {
@@ -812,6 +818,27 @@ mod tests {
             &TexturesDelta::default(),
         );
         assert_covers_only(&damage, &[SCREEN], &[]);
+    }
+
+    #[test]
+    fn far_away_geometry_moved_into_view_is_damaged() {
+        let far_rect = |color| {
+            let mut clipped = ClippedShape::new(
+                SCREEN,
+                Shape::rect_filled(
+                    Rect::from_min_size(pos2(2_000_000.0, 100.0), vec2(20.0, 20.0)),
+                    0.0,
+                    color,
+                ),
+            );
+            clipped.transform_after_tessellation =
+                emath::TSTransform::from_translation(vec2(-1_999_900.0, 0.0));
+            clipped
+        };
+        let mut tracker = tracker_after(&[far_rect(Color32::RED)]);
+        let damage = tracker.update(&[far_rect(Color32::BLUE)], 1.0, &TexturesDelta::default());
+        let seen = Rect::from_min_size(pos2(100.0, 100.0), vec2(20.0, 20.0));
+        assert_covers_only(&damage, &[seen], &[]);
     }
 
     #[test]
