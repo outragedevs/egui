@@ -886,10 +886,15 @@ impl Painter {
         let retained = surface_state
             .retained
             .get_or_insert_with(|| RetainedFrame::new(&render_state.device, format, width, height));
+        let tessellation = self.context.tessellation_options(|options| *options);
+        retained.tracker.set_feathering(if tessellation.feathering {
+            tessellation.feathering_size_in_pixels
+        } else {
+            0.0
+        });
         let tracked = retained
             .tracker
             .update(&shapes, screen_pixels_per_point, textures_delta);
-        let tessellation = self.context.tessellation_options(|options| *options);
         let mut damage =
             if surface_state.needs_reconfigure || retained.tessellation != Some(tessellation) {
                 epaint::Damage::Full

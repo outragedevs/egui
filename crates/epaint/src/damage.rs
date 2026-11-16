@@ -128,6 +128,9 @@ pub struct DamageTracker {
 
     /// Textures that changed outside the [`TexturesDelta`] of the next [`Self::update`].
     invalidated: HashSet<TextureId>,
+
+    /// The tessellator's feathering in physical pixels ([`Self::set_feathering`]).
+    feathering: f32,
 }
 
 struct Frame {
@@ -153,7 +156,7 @@ impl DamageTracker {
                 changed_textures.extend(self.invalidated.drain());
                 let areas = changed_shapes(&previous.shapes, shapes, &changed_textures)
                     .into_iter()
-                    .map(|clipped| painted_area(clipped, pixels_per_point));
+                    .map(|clipped| painted_area(clipped, pixels_per_point, self.feathering));
                 DamageRegion::from_rects(areas).map_or(Damage::None, Damage::Partial)
             }
             _ => Damage::Full,
@@ -168,6 +171,7 @@ impl DamageTracker {
 
     /// Forget the previous frame, e.g. when its pixels were lost. The next [`Self::update`] returns [`Damage::Full`].
     pub fn reset(&mut self) {
+        // the feathering stays: it describes the tessellator, not the previous frame
         self.previous = None;
         self.invalidated.clear();
     }
@@ -183,6 +187,17 @@ impl DamageTracker {
             })
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// How wide the tessellator feathers edges, in physical pixels (`TessellationOptions::feathering_size_in_pixels`,
+    /// or zero without feathering): an edge is painted that far beyond its shape. Without this call one pixel is
+    /// assumed, the tessellator's default.
+    pub fn set_feathering(&mut self, pixels: f32) {
+        self.feathering = if pixels.is_finite() {
+            pixels.max(0.0)
+        } else {
+            0.0
+        };
     }
 
     /// These textures changed in a [`TexturesDelta`] this tracker is not given, e.g. one applied while another
@@ -280,10 +295,12 @@ fn same_shape(before: &Shape, now: &Shape) -> bool {
 }
 
 /// Where `clipped` may touch pixels, in points.
-fn painted_area(clipped: &ClippedShape, pixels_per_point: f32) -> Rect {
-    // feathering spreads a pixel beyond the shape, pixel snapping and the rounded scissor rect up to half a pixel more
-    let margin = 2.0 / pixels_per_point;
-    let bounds = shape_bounds(&clipped.shape);
+fn painted_area(clipped: &ClippedShape, pixels_per_point: f32, feathering: f32) -> Rect {
+    // feathering spreads its width beyond the shape (one pixel by default), pixel snapping and the rounded
+    // scissor rect up to half a pixel more
+    let feathering = feathering.max(1.0) / pixels_per_point;
+    let margin = feathering + 1.0 / pixels_per_point;
+    let bounds = shape_bounds(&clipped.shape, feathering);
     if bounds.is_negative() {
         return Rect::NOTHING;
     }
@@ -301,11 +318,13 @@ fn painted_area(clipped: &ClippedShape, pixels_per_point: f32) -> Rect {
     }
 }
 
-fn shape_bounds(shape: &Shape) -> Rect {
+/// Where `shape` may touch pixels before feathering, which is `feathering` points wide.
+fn shape_bounds(shape: &Shape, feathering: f32) -> Rect {
+    let visual = shape.visual_bounding_rect();
     match shape {
         Shape::Vec(shapes) => shapes
             .iter()
-            .map(shape_bounds)
+            .map(|shape| shape_bounds(shape, feathering))
             .fold(Rect::NOTHING, Rect::union),
         Shape::Text(text) => text
             .galley
@@ -315,9 +334,12 @@ fn shape_bounds(shape: &Shape) -> Rect {
             .expand(text.underline.width.max(0.0))
             .rotate_bb(emath::Rot2::from_angle(text.angle))
             .translate(text.pos.to_vec2()),
-        // A stroke's joins are mitered: a sharp corner reaches beyond the stroke's own width.
-        Shape::Path(path) if !path.stroke.is_empty() => {
-            let reach = miter_reach(&path.points, path.closed) * path.stroke.width;
+        _ if visual.is_negative() => Rect::NOTHING,
+        // The joins of a stroke, and of a fill's feathered edge, are mitered: a sharp corner reaches beyond
+        // the stroke's own width.
+        Shape::Path(path) => {
+            let reach =
+                miter_reach(&path.points, path.closed) * (path.stroke.width.max(0.0) + feathering);
             if reach.is_finite() {
                 Rect::from_points(&path.points).expand(reach)
             } else {
@@ -325,9 +347,11 @@ fn shape_bounds(shape: &Shape) -> Rect {
             }
         }
         // Flattened to a path only when tessellated, so where its corners are is not known here.
-        Shape::QuadraticBezier(bezier) if !bezier.stroke.is_empty() => Rect::EVERYTHING,
-        Shape::CubicBezier(bezier) if !bezier.stroke.is_empty() => Rect::EVERYTHING,
-        _ => shape.visual_bounding_rect(),
+        Shape::QuadraticBezier(_) | Shape::CubicBezier(_) => Rect::EVERYTHING,
+        // Stroked outside the outline, where the visual bounds count half the stroke.
+        Shape::Circle(circle) => visual.expand(circle.stroke.width.max(0.0) * 0.5),
+        Shape::Ellipse(ellipse) => visual.expand(ellipse.stroke.width.max(0.0) * 0.5),
+        _ => visual,
     }
 }
 
@@ -749,6 +773,42 @@ mod tests {
         let damage = tracker.update(&[triangle], 1.0, &TexturesDelta::default());
         let tip = Rect::from_min_max(pos2(240.0, 30.0), pos2(260.0, 100.0));
         assert_covers_only(&damage, &[tip], &[]);
+    }
+
+    #[test]
+    fn the_stroke_of_a_circle_is_inside_the_damage() {
+        let circle = ClippedShape::new(
+            SCREEN,
+            Shape::circle_stroke(pos2(100.0, 100.0), 20.0, Stroke::new(20.0, Color32::BLACK)),
+        );
+        let mut tracker = tracker_after(&[]);
+        let damage = tracker.update(&[circle], 1.0, &TexturesDelta::default());
+        let stroke = Rect::from_min_max(pos2(59.5, 59.5), pos2(140.5, 140.5));
+        assert_covers_only(&damage, &[stroke], &[]);
+    }
+
+    #[test]
+    fn a_sharp_corner_of_a_fill_is_inside_the_damage() {
+        // Filled, not stroked: the feathered edge is mitered at the thin corner all the same.
+        let points = vec![pos2(50.0, 50.0), pos2(150.0, 50.0), pos2(50.0, 55.0)];
+        let triangle = ClippedShape::new(
+            SCREEN,
+            Shape::convex_polygon(points, Color32::RED, Stroke::NONE),
+        );
+        let mut tracker = tracker_after(&[]);
+        let damage = tracker.update(&[triangle], 1.0, &TexturesDelta::default());
+        let tip = Rect::from_min_max(pos2(150.0, 49.0), pos2(170.0, 52.0));
+        assert_covers_only(&damage, &[tip], &[]);
+    }
+
+    #[test]
+    fn a_wider_feathering_is_inside_the_damage() {
+        let shapes = [rect_at(100.0, 100.0)];
+        let mut tracker = tracker_after(&[]);
+        tracker.set_feathering(16.0);
+        let damage = tracker.update(&shapes, 1.0, &TexturesDelta::default());
+        let feathered = Rect::from_min_size(pos2(100.0, 100.0), vec2(10.0, 10.0)).expand(8.0);
+        assert_covers_only(&damage, &[feathered], &[]);
     }
 
     #[test]
