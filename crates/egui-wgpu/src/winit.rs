@@ -94,6 +94,15 @@ impl RepaintStats {
     }
 }
 
+/// Whether `shape` is, or holds, a paint callback.
+fn has_callback(shape: &epaint::Shape) -> bool {
+    match shape {
+        epaint::Shape::Vec(shapes) => shapes.iter().any(has_callback),
+        epaint::Shape::Callback(_) => true,
+        _ => false,
+    }
+}
+
 impl RetainedFrame {
     fn new(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -895,12 +904,19 @@ impl Painter {
         let tracked = retained
             .tracker
             .update(&shapes, screen_pixels_per_point, textures_delta);
-        let mut damage =
-            if surface_state.needs_reconfigure || retained.tessellation != Some(tessellation) {
-                epaint::Damage::Full
-            } else {
-                tracked
-            };
+        // The debug options paint beyond the clip rects the damage is limited to, and a callback
+        // can paint anywhere, scissor or not, even one the tracker matched to the last frame's.
+        let unbounded = tessellation.debug_ignore_clip_rects
+            || tessellation.debug_paint_clip_rects
+            || shapes.iter().any(|clipped| has_callback(&clipped.shape));
+        let mut damage = if surface_state.needs_reconfigure
+            || retained.tessellation != Some(tessellation)
+            || unbounded
+        {
+            epaint::Damage::Full
+        } else {
+            tracked
+        };
         retained.tessellation = Some(tessellation);
         retained.stats.record(&damage, screen);
 
