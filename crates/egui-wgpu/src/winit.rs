@@ -78,6 +78,10 @@ struct RepaintStats {
     longest_seconds: f64,
     /// That wait, summed over the painted frames. A software rasterizer may do its work in it.
     waiting_seconds: f64,
+    /// The stages of the painted frames, summed.
+    cost: FrameCost,
+    /// The frames that got a record of their own.
+    slow: u32,
 }
 
 impl RepaintStats {
@@ -101,7 +105,7 @@ impl RepaintStats {
             let [nothing, surface, options, unbounded] = self.reasons;
             log::debug!(
                 target: "egui_wgpu::partial_repaint",
-                "last {:.1} s at {}x{} px: {} frames skipped, {} partial (on average {:.0}% of the window, {:.1} ms), {} full ({:.1} ms; {nothing} with nothing to compare to, {surface} for the surface, {options} for options, {unbounded} for callbacks); longest {:.1} ms; waiting for the surface {:.1} ms a painted frame",
+                "last {:.1} s at {}x{} px: {} frames skipped, {} partial (on average {:.0}% of the window, {:.1} ms), {} full ({:.1} ms; {nothing} with nothing to compare to, {surface} for the surface, {options} for options, {unbounded} for callbacks); longest {:.1} ms; waiting for the surface {:.1} ms a painted frame (acquire {:.1}, submit {:.1}, present {:.1} ms); uploads {:.1} ms and {:.0} kB, buffers {:.1} ms a painted frame",
                 now.duration_since(since).as_secs_f32(),
                 pixels[0],
                 pixels[1],
@@ -113,6 +117,12 @@ impl RepaintStats {
                 1000.0 * per(self.full_seconds, self.full),
                 1000.0 * self.longest_seconds,
                 1000.0 * per(self.waiting_seconds, self.partial + self.full),
+                1000.0 * per(self.cost.acquire_seconds, self.partial + self.full),
+                1000.0 * per(self.cost.submit_seconds, self.partial + self.full),
+                1000.0 * per(self.cost.present_seconds, self.partial + self.full),
+                1000.0 * per(self.cost.upload_seconds, self.partial + self.full),
+                per(self.cost.upload_bytes as f64, self.partial + self.full) / 1000.0,
+                1000.0 * per(self.cost.buffers_seconds, self.partial + self.full),
             );
             *self = Self {
                 since: Some(now),
@@ -141,8 +151,40 @@ impl RepaintStats {
     }
 
     /// The frame last recorded took `seconds` to tessellate and paint, and `waiting` more
-    /// for the surface.
-    fn painted(&mut self, whole: bool, seconds: f64, waiting: f64) {
+    /// for the surface; `cost` is that by stage. A frame that took long gets a record of
+    /// its own, with what it filled (`fill`, computed only for such a frame) and the share
+    /// of the window it repainted.
+    fn painted(
+        &mut self,
+        whole: bool,
+        seconds: f64,
+        waiting: f64,
+        cost: &FrameCost,
+        share: f32,
+        fill: impl FnOnce() -> FrameFill,
+    ) {
+        self.cost.add(cost);
+        if seconds + waiting >= SLOW_FRAME_SECONDS && self.slow < SLOW_FRAMES_LOGGED {
+            self.slow += 1;
+            let fill = fill();
+            log::debug!(
+                target: "egui_wgpu::partial_repaint",
+                "slow frame: {:.0}% of the window; {} meshes, {} vertices, {} textures, filling {:.2} MP ({:.2} MP of images); tessellating and encoding {:.1} ms; uploads {:.1} ms and {:.0} kB; buffers {:.1} ms; acquire {:.1} ms; submit {:.1} ms; present {:.1} ms",
+                100.0 * share,
+                fill.meshes,
+                fill.vertices,
+                fill.textures,
+                fill.pixels / 1.0e6,
+                fill.image_pixels / 1.0e6,
+                1000.0 * seconds,
+                1000.0 * cost.upload_seconds,
+                cost.upload_bytes as f64 / 1000.0,
+                1000.0 * cost.buffers_seconds,
+                1000.0 * cost.acquire_seconds,
+                1000.0 * cost.submit_seconds,
+                1000.0 * cost.present_seconds,
+            );
+        }
         self.waiting_seconds += waiting;
         if whole {
             self.full_seconds += seconds;
@@ -151,6 +193,136 @@ impl RepaintStats {
         }
         self.longest_seconds = self.longest_seconds.max(seconds);
     }
+}
+
+/// What painting one frame cost, by stage, for the statistics.
+///
+/// A software rasterizer does the drawing itself in one of the last three stages, whichever
+/// its driver waits in, so those say what the frame's pixels cost.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct FrameCost {
+    /// Uploading new and changed textures, and how many bytes of them.
+    upload_seconds: f64,
+    upload_bytes: u64,
+    /// Uploading the vertices and indices.
+    buffers_seconds: f64,
+    /// `Surface::get_current_texture`.
+    acquire_seconds: f64,
+    /// `Queue::submit`.
+    submit_seconds: f64,
+    /// `Queue::present`.
+    present_seconds: f64,
+}
+
+impl FrameCost {
+    fn add(&mut self, other: &Self) {
+        self.upload_seconds += other.upload_seconds;
+        self.upload_bytes = self.upload_bytes.saturating_add(other.upload_bytes);
+        self.buffers_seconds += other.buffers_seconds;
+        self.acquire_seconds += other.acquire_seconds;
+        self.submit_seconds += other.submit_seconds;
+        self.present_seconds += other.present_seconds;
+    }
+}
+
+/// How much a frame's meshes fill, for the statistics: an estimate of the pixels the
+/// rasterizer shades, which with overlapping meshes is more than the pixels painted.
+/// An estimate: a mesh counts for its triangles' area, at most the part of its bounds that
+/// is repainted.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct FrameFill {
+    meshes: u32,
+    vertices: u64,
+    /// Pixels filled by all meshes, and by those that draw a texture of the app's (an
+    /// image) rather than egui's own (text and plain shapes).
+    pixels: f64,
+    image_pixels: f64,
+    /// How many different textures the meshes draw.
+    textures: u32,
+}
+
+impl FrameFill {
+    /// The fill of `primitives` within the rectangles of `damage` (all of `screen` for
+    /// `None`, a whole repaint). A mesh fills its triangles' area, at most what its clip
+    /// rectangle shows.
+    fn of(
+        primitives: &[epaint::ClippedPrimitive],
+        damage: Option<&[egui::Rect]>,
+        screen: egui::Rect,
+        pixels_per_point: f32,
+    ) -> Self {
+        let mut fill = Self::default();
+        let mut textures: Vec<epaint::TextureId> = Vec::new();
+        for epaint::ClippedPrimitive {
+            clip_rect,
+            primitive,
+        } in primitives
+        {
+            let epaint::Primitive::Mesh(mesh) = primitive else {
+                continue;
+            };
+            // What the mesh can cover at all: its vertices' bounds within its clip.
+            let mut bounds = egui::Rect::NOTHING;
+            for vertex in &mesh.vertices {
+                if vertex.pos.x.is_finite() && vertex.pos.y.is_finite() {
+                    bounds.extend_with(vertex.pos);
+                }
+            }
+            let clip = clip_rect.intersect(screen).intersect(bounds);
+            let shown: f32 = match damage {
+                None => clip.area().max(0.0),
+                Some(rects) => rects
+                    .iter()
+                    .map(|r| {
+                        let r = r.intersect(clip);
+                        if r.is_positive() { r.area() } else { 0.0 }
+                    })
+                    .sum(),
+            };
+            if !clip.is_positive() || shown <= 0.0 {
+                continue;
+            }
+            let mut area = 0.0_f64;
+            for triangle in mesh.indices.chunks_exact(3) {
+                let corner = |i: usize| {
+                    triangle
+                        .get(i)
+                        .and_then(|index| mesh.vertices.get(*index as usize))
+                        .map(|v| v.pos)
+                };
+                if let (Some(a), Some(b), Some(c)) = (corner(0), corner(1), corner(2)) {
+                    let doubled = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+                    if doubled.is_finite() {
+                        area += f64::from(doubled.abs()) / 2.0;
+                    }
+                }
+            }
+            let pixels =
+                area.min(f64::from(shown)) * f64::from(pixels_per_point * pixels_per_point);
+            fill.meshes += 1;
+            fill.vertices = fill.vertices.saturating_add(mesh.vertices.len() as u64);
+            fill.pixels += pixels;
+            if mesh.texture_id != epaint::TextureId::default() {
+                fill.image_pixels += pixels;
+            }
+            if !textures.contains(&mesh.texture_id) {
+                textures.push(mesh.texture_id);
+            }
+        }
+        fill.textures = textures.len() as u32;
+        fill
+    }
+}
+
+/// A frame whose stages took this long together gets a record of its own.
+const SLOW_FRAME_SECONDS: f64 = 0.05;
+
+/// How many such records one interval of the statistics may write.
+const SLOW_FRAMES_LOGGED: u32 = 12;
+
+/// Whether the statistics are being logged, so what only they need is worth computing.
+fn stats_logged() -> bool {
+    log::log_enabled!(target: "egui_wgpu::partial_repaint", log::Level::Debug)
 }
 
 /// Whether `shape` is, or holds, a paint callback.
@@ -281,6 +453,9 @@ pub struct Painter {
     depth_texture_view: ViewportIdMap<wgpu::TextureView>,
     msaa_texture_view: ViewportIdMap<wgpu::TextureView>,
     surfaces: ViewportIdMap<SurfaceState>,
+
+    /// What the frame painted last cost, for the partial-repaint statistics.
+    frame_cost: FrameCost,
 }
 
 impl Painter {
@@ -310,6 +485,7 @@ impl Painter {
             options,
             support_transparent_backbuffer,
             screen_capture_state: None,
+            frame_cost: FrameCost::default(),
 
             instance,
             render_state: None,
@@ -1036,11 +1212,34 @@ impl Painter {
             && let Some(retained) = &mut surface_state.retained
         {
             let waiting = f64::from(vsync_sec.max(0.0));
-            retained.stats.painted(
-                damage == epaint::Damage::Full,
-                (started.elapsed().as_secs_f64() - waiting).max(0.0),
-                waiting,
-            );
+            let share = match &damage {
+                epaint::Damage::None => 0.0,
+                epaint::Damage::Full => 1.0,
+                epaint::Damage::Partial(region) => {
+                    let area: f32 = region
+                        .rects()
+                        .iter()
+                        .map(|r| r.intersect(screen).area().max(0.0))
+                        .sum();
+                    area / screen.area().max(1.0)
+                }
+            };
+            if stats_logged() {
+                retained.stats.painted(
+                    damage == epaint::Damage::Full,
+                    (started.elapsed().as_secs_f64() - waiting).max(0.0),
+                    waiting,
+                    &self.frame_cost,
+                    share,
+                    || {
+                        let rects = match &damage {
+                            epaint::Damage::Partial(region) => Some(region.rects()),
+                            _ => None,
+                        };
+                        FrameFill::of(&clipped_primitives, rects, screen, pixels_per_point)
+                    },
+                );
+            }
             if callback {
                 // What it painted outside its rectangle stays when the callback goes: the
                 // frame after one is repainted whole too.
@@ -1090,6 +1289,7 @@ impl Painter {
 
         let capture = !capture_data.is_empty();
         let mut vsync_sec = 0.0;
+        self.frame_cost = FrameCost::default();
 
         // If the previous frame produced `CurrentSurfaceTexture::Lost`, the action match
         // below set `needs_recreate`. Recreate the surface now, before re-borrowing
@@ -1133,9 +1333,16 @@ impl Painter {
 
         let user_cmd_bufs = {
             let mut renderer = render_state.renderer.write();
+            let start = web_time::Instant::now();
             #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
             for (id, image_deltas) in textures_delta.set.drain() {
                 for image_delta in image_deltas {
+                    let [width, height] = image_delta.image.size();
+                    let bytes = width
+                        .saturating_mul(height)
+                        .saturating_mul(image_delta.image.bytes_per_pixel());
+                    self.frame_cost.upload_bytes =
+                        self.frame_cost.upload_bytes.saturating_add(bytes as u64);
                     renderer.update_texture(
                         &render_state.device,
                         &render_state.queue,
@@ -1144,14 +1351,18 @@ impl Painter {
                     );
                 }
             }
+            self.frame_cost.upload_seconds = start.elapsed().as_secs_f64();
 
-            renderer.update_buffers(
+            let start = web_time::Instant::now();
+            let user_cmd_bufs = renderer.update_buffers(
                 &render_state.device,
                 &render_state.queue,
                 &mut encoder,
                 clipped_primitives,
                 &screen_descriptor,
-            )
+            );
+            self.frame_cost.buffers_seconds = start.elapsed().as_secs_f64();
+            user_cmd_bufs
         };
 
         if surface_state.needs_reconfigure {
@@ -1164,6 +1375,7 @@ impl Painter {
             // This is what vsync-waiting happens on my Mac.
             let start = web_time::Instant::now();
             let output_frame = surface_state.surface.get_current_texture();
+            self.frame_cost.acquire_seconds = start.elapsed().as_secs_f64();
             vsync_sec += start.elapsed().as_secs_f32();
             output_frame
         };
@@ -1367,6 +1579,7 @@ impl Painter {
             render_state
                 .queue
                 .submit(core::iter::chain(user_cmd_bufs, [encoded]));
+            self.frame_cost.submit_seconds = start.elapsed().as_secs_f64();
             vsync_sec += start.elapsed().as_secs_f32();
         };
 
@@ -1397,6 +1610,7 @@ impl Painter {
             // wgpu doesn't document where vsync can happen. Maybe here?
             let start = web_time::Instant::now();
             render_state.queue.present(output_frame);
+            self.frame_cost.present_seconds = start.elapsed().as_secs_f64();
             vsync_sec += start.elapsed().as_secs_f32();
         }
 
@@ -1431,6 +1645,82 @@ impl Painter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_frames_fill_is_its_triangles_within_the_damage_and_the_clip() {
+        use super::{FrameCost, FrameFill};
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let quad = |rect: egui::Rect, texture_id| {
+            let mut mesh = epaint::Mesh::with_texture(texture_id);
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            mesh.add_rect_with_uv(rect, uv, egui::Color32::WHITE);
+            mesh
+        };
+        let image = epaint::TextureId::User(7);
+        let rect = |x: f32, y: f32, w: f32, h: f32| {
+            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h))
+        };
+        let primitives = vec![
+            // 40x50 points of an image, all shown.
+            epaint::ClippedPrimitive {
+                clip_rect: screen,
+                primitive: epaint::Primitive::Mesh(quad(rect(0.0, 0.0, 40.0, 50.0), image)),
+            },
+            // A plain 100x100 quad, of which the clip shows 10x10.
+            epaint::ClippedPrimitive {
+                clip_rect: rect(50.0, 50.0, 10.0, 10.0),
+                primitive: epaint::Primitive::Mesh(quad(screen, epaint::TextureId::default())),
+            },
+            // Wholly outside the window: not counted.
+            epaint::ClippedPrimitive {
+                clip_rect: rect(200.0, 0.0, 10.0, 10.0),
+                primitive: epaint::Primitive::Mesh(quad(rect(200.0, 0.0, 10.0, 10.0), image)),
+            },
+        ];
+        let whole = FrameFill::of(&primitives, None, screen, 2.0);
+        assert_eq!((whole.meshes, whole.vertices, whole.textures), (2, 8, 2));
+        // At two pixels a point: 2000 and 100 square points.
+        assert_eq!(whole.pixels, 8400.0);
+        assert_eq!(whole.image_pixels, 8000.0);
+
+        // Only the left 20 points are damaged: half the image, none of the plain quad.
+        let damage = [rect(0.0, 0.0, 20.0, 100.0)];
+        let part = FrameFill::of(&primitives, Some(&damage), screen, 1.0);
+        assert_eq!(
+            (part.meshes, part.pixels, part.image_pixels),
+            (1, 1000.0, 1000.0)
+        );
+
+        assert_eq!(
+            FrameFill::of(&primitives, Some(&[]), screen, 1.0),
+            FrameFill::default()
+        );
+
+        // Indices that point nowhere are skipped, not a panic.
+        let mut broken = quad(screen, image);
+        broken.indices.push(99);
+        broken.indices.push(98);
+        broken.indices.push(97);
+        let broken = [epaint::ClippedPrimitive {
+            clip_rect: screen,
+            primitive: epaint::Primitive::Mesh(broken),
+        }];
+        assert_eq!(FrameFill::of(&broken, None, screen, 1.0).pixels, 10000.0);
+
+        let mut sum = FrameCost::default();
+        let one = FrameCost {
+            upload_seconds: 0.5,
+            upload_bytes: 10,
+            buffers_seconds: 0.25,
+            acquire_seconds: 1.0,
+            submit_seconds: 2.0,
+            present_seconds: 3.0,
+        };
+        sum.add(&one);
+        sum.add(&one);
+        assert_eq!(sum.upload_bytes, 20);
+        assert_eq!(sum.present_seconds, 6.0);
+    }
+
     use super::surface_fit;
 
     #[test]
